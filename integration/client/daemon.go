@@ -21,12 +21,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
+	"time"
 
-	. "github.com/containerd/containerd"
-	exec "golang.org/x/sys/execabs"
+	"github.com/containerd/plugin"
+
+	. "github.com/containerd/containerd/v2/client"
 )
 
 type daemon struct {
@@ -59,21 +63,45 @@ func (d *daemon) waitForStart(ctx context.Context) (*Client, error) {
 		client  *Client
 		serving bool
 		err     error
+		ticker  = time.NewTicker(500 * time.Millisecond)
 	)
+	defer ticker.Stop()
 
-	client, err = New(d.addr)
-	if err != nil {
-		return nil, err
-	}
-	serving, err = client.IsServing(ctx)
-	if !serving {
-		client.Close()
-		if err == nil {
-			err = errors.New("connection was successful but service is not available")
+	for {
+		select {
+		case <-ticker.C:
+			client, err = New(d.addr)
+			if err != nil {
+				continue
+			}
+			serving, err = client.IsServing(ctx)
+			if !serving {
+				client.Close()
+				if err == nil {
+					err = errors.New("connection was successful but service is not available")
+				}
+				continue
+			}
+			resp, perr := client.IntrospectionService().Plugins(ctx)
+			if perr != nil {
+				return nil, fmt.Errorf("failed to get plugin list: %w", perr)
+			}
+			var loadErr error
+			for _, p := range resp.Plugins {
+				if p.InitErr != nil && !strings.Contains(p.InitErr.Message, plugin.ErrSkipPlugin.Error()) {
+					pluginErr := fmt.Errorf("failed to load %s.%s: %s", p.Type, p.ID, p.InitErr.Message)
+					loadErr = errors.Join(loadErr, pluginErr)
+				}
+			}
+			if loadErr != nil {
+				return nil, loadErr
+			}
+
+			return client, err
+		case <-ctx.Done():
+			return nil, fmt.Errorf("context deadline exceeded: %w", err)
 		}
-		return nil, err
 	}
-	return client, err
 }
 
 func (d *daemon) Stop() error {
