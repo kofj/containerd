@@ -23,35 +23,41 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"runtime"
 	"testing"
 	"time"
 
-	. "github.com/containerd/containerd"
-	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/images"
-	imagelist "github.com/containerd/containerd/integration/images"
-	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/log"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/pkg/testutil"
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/sys"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/identity"
-	"github.com/sirupsen/logrus"
-	exec "golang.org/x/sys/execabs"
+	"github.com/opencontainers/runtime-spec/specs-go/features"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel"
+
+	. "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/defaults"
+	imagelist "github.com/containerd/containerd/v2/integration/images"
+	"github.com/containerd/containerd/v2/pkg/deprecation"
+	"github.com/containerd/containerd/v2/pkg/namespaces"
+	"github.com/containerd/containerd/v2/pkg/testutil"
+	"github.com/containerd/errdefs"
+	"github.com/containerd/log"
+	"github.com/containerd/platforms"
 )
 
 var (
 	noDaemon     bool
 	noCriu       bool
 	supportsCriu bool
+	noShimCgroup bool
 )
 
 func init() {
 	flag.BoolVar(&noDaemon, "no-daemon", false, "Do not start a dedicated daemon for the tests")
 	flag.BoolVar(&noCriu, "no-criu", false, "Do not run the checkpoint tests")
+	flag.BoolVar(&noShimCgroup, "no-shim-cgroup", false, "Do not run the shim cgroup tests")
 }
 
 func TestMain(m *testing.M) {
@@ -71,7 +77,7 @@ func TestMain(m *testing.M) {
 	defer cancel()
 
 	if !noDaemon {
-		sys.ForceRemoveAll(defaultRoot)
+		_ = forceRemoveAll(defaultRoot)
 
 		stdioFile, err := os.CreateTemp("", "")
 		if err != nil {
@@ -119,14 +125,14 @@ func TestMain(m *testing.M) {
 	}
 
 	// allow comparison with containerd under test
-	log.G(ctx).WithFields(logrus.Fields{
+	log.G(ctx).WithFields(log.Fields{
 		"version":     version.Version,
 		"revision":    version.Revision,
 		"runtime":     os.Getenv("TEST_RUNTIME"),
 		"snapshotter": os.Getenv("TEST_SNAPSHOTTER"),
 	}).Info("running tests against containerd")
 
-	snapshotter := DefaultSnapshotter
+	snapshotter := defaults.DefaultSnapshotter
 	if ss := os.Getenv("TEST_SNAPSHOTTER"); ss != "" {
 		snapshotter = ss
 	}
@@ -173,7 +179,7 @@ func TestMain(m *testing.M) {
 			}
 		}
 
-		if err := sys.ForceRemoveAll(defaultRoot); err != nil {
+		if err := forceRemoveAll(defaultRoot); err != nil {
 			fmt.Fprintln(os.Stderr, "failed to remove test root dir", err)
 			os.Exit(1)
 		}
@@ -186,7 +192,7 @@ func TestMain(m *testing.M) {
 	os.Exit(status)
 }
 
-func newClient(t testing.TB, address string, opts ...ClientOpt) (*Client, error) {
+func newClient(t testing.TB, address string, opts ...Opt) (*Client, error) {
 	if testing.Short() {
 		t.Skip()
 	}
@@ -417,6 +423,7 @@ func TestImagePullSomePlatforms(t *testing.T) {
 }
 
 func TestImagePullSchema1(t *testing.T) {
+	t.Setenv(deprecation.EnvPullSchema1Image, "1")
 	client, err := newClient(t, address)
 	if err != nil {
 		t.Fatal(err)
@@ -454,6 +461,34 @@ func TestImagePullWithConcurrencyLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestImagePullWithTracing(t *testing.T) {
+	client, err := newClient(t, address)
+	require.NoError(t, err)
+	defer client.Close()
+
+	ctx := namespaces.WithNamespace(context.Background(), "tracing")
+
+	//create in memory exporter and global tracer provider for test
+	exp, tp := newInMemoryExporterTracer()
+	//set the tracer provider global available
+	otel.SetTracerProvider(tp)
+	// Shutdown properly so nothing leaks.
+	defer func() { _ = tp.Shutdown(ctx) }()
+
+	//do an image pull which is instrumented, we should expect spans in the exporter
+	_, err = client.Pull(ctx, testImage, WithPlatformMatcher(platforms.Default()))
+	require.NoError(t, err)
+
+	err = tp.ForceFlush(ctx)
+	require.NoError(t, err)
+
+	//The span name was defined in client.pull when instrumented it
+	spanNameExpected := "pull.Pull"
+	spans := exp.GetSpans()
+	validateRootSpan(t, spanNameExpected, spans)
+
 }
 
 func TestClientReconnect(t *testing.T) {
@@ -513,5 +548,48 @@ func TestDefaultRuntimeWithNamespaceLabels(t *testing.T) {
 	defer testClient.Close()
 	if testClient.Runtime() != testRuntime {
 		t.Error("failed to set default runtime from namespace labels")
+	}
+}
+
+func TestRuntimeInfo(t *testing.T) {
+	t.Parallel()
+
+	if runtime.GOOS == "windows" {
+		t.Skip("io.containerd.runhcs.v1 does not implement `containerd-shim-runhcs-v1.exe -info` yet")
+	}
+
+	client, err := newClient(t, address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	rti, err := client.RuntimeInfo(ctx, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rti.Name == "" {
+		t.Fatal("got empty RuntimeInfo.Name")
+	}
+
+	feat, ok := rti.Features.(*features.Features)
+	if !ok {
+		t.Fatalf("expected RuntimeInfo.Features to be *features.Features, got %T", rti.Features)
+	}
+
+	var rroRecognized bool
+	for _, f := range feat.MountOptions {
+		// "rro" is recognized since runc v1.1.
+		// The functionality needs kernel >= 5.12, but `runc features` consistently include "rro" in feat.MountOptions.
+		if f == "rro" {
+			rroRecognized = true
+		}
+	}
+	if !rroRecognized {
+		t.Fatalf("expected feat.MountOptions to contain \"rro\", only got %v", feat.MountOptions)
 	}
 }

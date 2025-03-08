@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/integration/images"
+	"github.com/containerd/containerd/v2/integration/images"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
@@ -61,7 +61,7 @@ func TestContainerStats(t *testing.T) {
 		if err != nil {
 			return false, err
 		}
-		if s.GetWritableLayer().GetUsedBytes().GetValue() != 0 {
+		if s.GetWritableLayer().GetTimestamp() != 0 {
 			return true, nil
 		}
 		return false, nil
@@ -103,8 +103,14 @@ func TestContainerConsumedStats(t *testing.T) {
 		if err != nil {
 			return false, err
 		}
-		if s.GetMemory().GetWorkingSetBytes().GetValue() > 0 {
-			return true, nil
+		if goruntime.GOOS == "windows" {
+			if s.GetMemory().GetWorkingSetBytes().GetValue() > 0 {
+				return true, nil
+			}
+		} else {
+			if s.GetWritableLayer().GetTimestamp() > 0 {
+				return true, nil
+			}
 		}
 		return false, nil
 	}, time.Second, 30*time.Second))
@@ -179,7 +185,7 @@ func TestContainerListStats(t *testing.T) {
 			return false, err
 		}
 		for _, s := range stats {
-			if s.GetWritableLayer().GetUsedBytes().GetValue() == 0 {
+			if s.GetWritableLayer().GetTimestamp() == 0 {
 				return false, nil
 			}
 		}
@@ -238,7 +244,7 @@ func TestContainerListStatsWithIdFilter(t *testing.T) {
 			if len(stats) != 1 {
 				return false, errors.New("unexpected stats length")
 			}
-			if stats[0].GetWritableLayer().GetUsedBytes().GetValue() != 0 {
+			if stats[0].GetWritableLayer().GetTimestamp() != 0 {
 				return true, nil
 			}
 			return false, nil
@@ -246,7 +252,7 @@ func TestContainerListStatsWithIdFilter(t *testing.T) {
 
 		t.Logf("Verify container stats for %s", id)
 		for _, s := range stats {
-			require.Equal(t, s.GetAttributes().GetId(), id)
+			require.Equal(t, id, s.GetAttributes().GetId())
 			testStats(t, s, containerConfigMap[id])
 		}
 	}
@@ -300,7 +306,7 @@ func TestContainerListStatsWithSandboxIdFilter(t *testing.T) {
 
 		for _, containerStats := range stats {
 			// Wait for stats on all containers, not just the first one in the list.
-			if containerStats.GetWritableLayer().GetUsedBytes().GetValue() == 0 {
+			if containerStats.GetWritableLayer().GetTimestamp() == 0 {
 				return false, nil
 			}
 		}
@@ -358,7 +364,7 @@ func TestContainerListStatsWithIdSandboxIdFilter(t *testing.T) {
 			if len(stats) != 1 {
 				return false, errors.New("unexpected stats length")
 			}
-			if stats[0].GetWritableLayer().GetUsedBytes().GetValue() != 0 {
+			if stats[0].GetWritableLayer().GetTimestamp() != 0 {
 				return true, nil
 			}
 			return false, nil
@@ -380,7 +386,7 @@ func TestContainerListStatsWithIdSandboxIdFilter(t *testing.T) {
 			if len(stats) != 1 {
 				return false, fmt.Errorf("expected only one stat, but got %v", stats)
 			}
-			if stats[0].GetWritableLayer().GetUsedBytes().GetValue() != 0 {
+			if stats[0].GetWritableLayer().GetTimestamp() != 0 {
 				return true, nil
 			}
 			return false, nil
@@ -400,9 +406,9 @@ func testStats(t *testing.T,
 	require.NotEmpty(t, s.GetAttributes().GetId())
 	require.NotEmpty(t, s.GetAttributes().GetMetadata())
 	require.NotEmpty(t, s.GetAttributes().GetAnnotations())
-	require.Equal(t, s.GetAttributes().GetLabels(), config.Labels)
-	require.Equal(t, s.GetAttributes().GetAnnotations(), config.Annotations)
-	require.Equal(t, s.GetAttributes().GetMetadata().Name, config.Metadata.Name)
+	require.Equal(t, config.Labels, s.GetAttributes().GetLabels())
+	require.Equal(t, config.Annotations, s.GetAttributes().GetAnnotations())
+	require.Equal(t, config.Metadata.Name, s.GetAttributes().GetMetadata().Name)
 	require.NotEmpty(t, s.GetAttributes().GetLabels())
 	require.NotEmpty(t, s.GetCpu().GetTimestamp())
 	require.NotEmpty(t, s.GetCpu().GetUsageCoreNanoSeconds().GetValue())
@@ -410,10 +416,95 @@ func testStats(t *testing.T,
 	require.NotEmpty(t, s.GetMemory().GetWorkingSetBytes().GetValue())
 	require.NotEmpty(t, s.GetWritableLayer().GetTimestamp())
 	require.NotEmpty(t, s.GetWritableLayer().GetFsId().GetMountpoint())
-	require.NotEmpty(t, s.GetWritableLayer().GetUsedBytes().GetValue())
+
+	// UsedBytes of a fresh container can be zero on Linux, depending on the backing filesystem.
+	// https://github.com/containerd/containerd/issues/7909
+	if goruntime.GOOS == "windows" {
+		require.NotEmpty(t, s.GetWritableLayer().GetUsedBytes().GetValue())
+	}
 
 	// Windows does not collect inodes stats.
 	if goruntime.GOOS != "windows" {
 		require.NotEmpty(t, s.GetWritableLayer().GetInodesUsed().GetValue())
+	}
+}
+
+func TestContainerSysfsStatsWithPrivilegedPod(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("Doesn't care about filesystem properties on windows")
+	}
+	testImage := images.Get(images.BusyBox)
+	testcases := []struct {
+		name                               string
+		privilegedPod, privilegedContainer bool
+		expectedSysfsOption, expectedErr   string
+	}{
+		{
+			name:                "sandbox and container with privileged=true, sysfs is rw",
+			privilegedPod:       true,
+			privilegedContainer: true,
+			expectedSysfsOption: "rw",
+		},
+		{
+			name:                "sandbox with privileged=true, and container with privileged=false, sysfs is ro",
+			privilegedPod:       true,
+			privilegedContainer: false,
+			expectedSysfsOption: "ro",
+		},
+		{
+			name:                "sandbox and container with privileged=false, sysfs is ro",
+			privilegedPod:       false,
+			privilegedContainer: false,
+			expectedSysfsOption: "ro",
+		},
+		{
+			name:                "sandbox with privileged=false, and container with privileged=true, create container failed",
+			privilegedPod:       false,
+			privilegedContainer: true,
+			expectedErr:         "failed to generate spec opts: no privileged container allowed in sandbox",
+		},
+	}
+	for _, test := range testcases {
+		t.Run(test.name, func(t *testing.T) {
+			EnsureImageExists(t, testImage)
+			sb, sbConfig := PodSandboxConfigWithCleanup(
+				t,
+				"sandbox",
+				"sysfs-stats-with-privileged",
+				WithPodSecurityContext(test.privilegedPod),
+			)
+			cnConfig := ContainerConfig(
+				"container",
+				testImage,
+				WithCommand("sh", "-c", "top"),
+				WithSecurityContext(test.privilegedContainer),
+			)
+			cn, err := runtimeService.CreateContainer(sb, cnConfig, sbConfig)
+			if test.expectedErr != "" && err != nil {
+				assert.Contains(t, err.Error(), test.expectedErr)
+				return
+			}
+			assert.NoError(t, err)
+			defer func() {
+				if test.expectedErr == "" {
+					assert.NoError(t, runtimeService.RemoveContainer(cn))
+				}
+			}()
+
+			t.Log("Start the container")
+			require.NoError(t, runtimeService.StartContainer(cn))
+			defer func() {
+				assert.NoError(t, runtimeService.StopContainer(cn, 10))
+			}()
+
+			t.Logf("Execute cmd in container by sync")
+			mountinfo, _, err := runtimeService.ExecSync(cn, []string{
+				"sh",
+				"-c",
+				"mount |grep sysfs",
+			}, 10)
+			assert.NoError(t, err)
+			assert.Contains(t, string(mountinfo), test.expectedSysfsOption)
+		})
 	}
 }
